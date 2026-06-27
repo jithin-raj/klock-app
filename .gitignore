@@ -76,3 +76,7 @@ yarn-error.log
 
 # Local Claude config
 .claude/
+
+# Firebase Admin SDK service-account keys (server-side secret — never commit)
+*-firebase-adminsdk-*.json
+serviceAccountKey.json

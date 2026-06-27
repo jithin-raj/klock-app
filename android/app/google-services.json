@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "148623012736",
+    "project_id": "klock-mobile-android",
+    "storage_bucket": "klock-mobile-android.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:148623012736:android:69dc044bdb8f1bc8864765",
+        "android_client_info": {
+          "package_name": "com.klock.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCbEBHu6jH2KrpzzNpZ3vRLdKpWQnxb9Rs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
