@@ -35,7 +35,15 @@
 		<true/>
 	</dict>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string></string>
+	<string>Used to verify your location when you clock in.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Used to capture your photo for attendance.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Used when capturing video for attendance.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIRequiredDeviceCapabilities</key>
