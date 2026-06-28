@@ -18,6 +18,15 @@ jest.mock('react-native-device-info', () => ({
   default: {getUniqueId: jest.fn().mockResolvedValue('test-device-id')},
 }));
 
+jest.mock('@react-native-async-storage/async-storage', () => ({
+  __esModule: true,
+  default: {
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 jest.mock('react-native-webview', () => {
   const React = require('react');
   return {WebView: () => React.createElement('WebView')};

@@ -75,4 +75,15 @@ logout() {
 | Direction | Mechanism | Messages |
 |---|---|---|
 | Native → Web | `injectJavaScript` | `window.__IS_MOBILE__ = true`; `klocky:device` {deviceId, platform, fcmToken}; `klocky:navigate` {route}; `klocky:push` {data} |
-| Web → Native | `window.ReactNativeWebView.postMessage(JSON.stringify(...))` | `{type:'ready'}`, `{type:'requestDevice'}`, `{type:'loggedIn'}`, `{type:'loggedOut'}` |
+| Web → Native | `window.ReactNativeWebView.postMessage(JSON.stringify(...))` | `{type:'ready'}`, `{type:'requestDevice'}`, `{type:'loggedIn'}`, `{type:'loggedOut'}`, `{type:'ls', data}` |
+
+## Session persistence (no Angular change needed)
+
+The shell mirrors the WebView's `localStorage` into native storage on every write
+(`{type:'ls'}`, sent automatically by an injected hook) and restores it **before the
+page loads** on next launch. This keeps the Angular session alive when the app is
+swiped from recents / killed by the OS — Android WebView otherwise batches its
+localStorage writes and can drop the most recent ones on an abrupt kill. The token
+stays wherever Angular already puts it in `localStorage`; the shell never reads or
+parses it. (A deliberate "Clear data/storage" from app settings still logs out, by
+OS design — nothing in the app sandbox survives that.)

@@ -1,6 +1,7 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {
   ActivityIndicator,
+  AppState,
   BackHandler,
   Platform,
   PermissionsAndroid,
@@ -16,6 +17,7 @@ import {WebView as WebViewBase, WebViewMessageEvent} from 'react-native-webview'
 import type {WebViewNavigation} from 'react-native-webview';
 import messaging from '@react-native-firebase/messaging';
 import DeviceInfo from 'react-native-device-info';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // react-native-webview@14 isn't yet typed for React 19's stricter JSX, which
 // collapses the class component's props to `never`. Alias it to a properly typed
@@ -26,6 +28,38 @@ const WebView = WebViewBase as unknown as React.ComponentType<
 
 const WEB_APP_URL = 'https://klock.vercel.app'; // <-- the Angular app URL
 
+// Where we persist the WebView's localStorage so the session survives the app
+// being swiped from recents / killed by the OS. (Android WebView batches its own
+// localStorage writes to disk and can drop the most recent ones on an abrupt kill,
+// which logs the user out — we mirror it here and restore it before Angular boots.)
+const LS_SNAPSHOT_KEY = 'klocky.localStorage.snapshot';
+
+// Runs in the page after each load: mirror localStorage back to native on every
+// write (so the saved copy is always current, even right before an abrupt kill).
+const CAPTURE_HOOK = `
+(function () {
+  if (window.__klockyLSHook) { return; }
+  window.__klockyLSHook = true;
+  function snap() {
+    try {
+      var o = {};
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        o[k] = localStorage.getItem(k);
+      }
+      window.ReactNativeWebView.postMessage(JSON.stringify({type: 'ls', data: o}));
+    } catch (e) {}
+  }
+  var _set = localStorage.setItem.bind(localStorage);
+  var _rem = localStorage.removeItem.bind(localStorage);
+  var _clr = localStorage.clear.bind(localStorage);
+  localStorage.setItem = function (k, v) { _set(k, v); snap(); };
+  localStorage.removeItem = function (k) { _rem(k); snap(); };
+  localStorage.clear = function () { _clr(); snap(); };
+  snap();
+})();
+true;`;
+
 export default function App() {
   const webRef = useRef<WebViewBase>(null);
   const [, setDeviceId] = useState<string>('');
@@ -33,9 +67,24 @@ export default function App() {
   const [error, setError] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const canGoBack = useRef(false);
+  // undefined = still reading the saved snapshot; string = the JSON to restore
+  // (or null if there's nothing saved yet). We hold the WebView until it's known.
+  const [snapshot, setSnapshot] = useState<string | null | undefined>(undefined);
 
-  // Inject the mobile flag as early as possible so the Angular HTTP interceptor sees it.
-  const beforeLoad = 'window.__IS_MOBILE__ = true; true;';
+  useEffect(() => {
+    AsyncStorage.getItem(LS_SNAPSHOT_KEY)
+      .then(v => setSnapshot(v))
+      .catch(() => setSnapshot(null));
+  }, []);
+
+  // Inject the mobile flag + restore the saved localStorage as early as possible,
+  // before Angular bootstraps, so its auth guard sees the token and stays signed in.
+  const beforeLoad =
+    'window.__IS_MOBILE__ = true;' +
+    (snapshot
+      ? `try{var d=${snapshot};for(var k in d){if(Object.prototype.hasOwnProperty.call(d,k)){localStorage.setItem(k,d[k]);}}}catch(e){}`
+      : '') +
+    ' true;';
 
   async function requestPermissions() {
     try {
@@ -130,10 +179,21 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
+  // Persist the latest localStorage so it survives the app being killed. Keep the
+  // in-memory `snapshot` in sync too, so a same-session WebView reload restores it.
+  function saveSnapshot(json: string) {
+    setSnapshot(json);
+    AsyncStorage.setItem(LS_SNAPSHOT_KEY, json).catch(() => {});
+  }
+
   // Messages from the Angular app.
   function onMessage(e: WebViewMessageEvent) {
     try {
       const msg = JSON.parse(e.nativeEvent.data);
+      if (msg.type === 'ls') {
+        saveSnapshot(JSON.stringify(msg.data ?? {}));
+        return;
+      }
       if (msg.type === 'requestDevice' || msg.type === 'loggedIn') {
         pushDeviceInfo();
       }
@@ -141,6 +201,21 @@ export default function App() {
       // /logout with deviceId.
     } catch {}
   }
+
+  // Final flush when the app is backgrounded (often the last event before a
+  // swipe-from-recents kill): ask the page to push its current localStorage.
+  useEffect(() => {
+    const flush =
+      'try{var o={};for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);' +
+      'o[k]=localStorage.getItem(k);}' +
+      "window.ReactNativeWebView.postMessage(JSON.stringify({type:'ls',data:o}));}catch(e){} true;";
+    const sub = AppState.addEventListener('change', state => {
+      if (state !== 'active') {
+        webRef.current?.injectJavaScript(flush);
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   function onNavStateChange(nav: WebViewNavigation) {
     canGoBack.current = nav.canGoBack;
@@ -156,6 +231,18 @@ export default function App() {
     setRefreshing(true);
     webRef.current?.reload();
     setRefreshing(false);
+  }
+
+  // Wait until the saved localStorage has been read, so it can be restored into
+  // the WebView before Angular bootstraps (avoids a flash of the login screen).
+  if (snapshot === undefined) {
+    return (
+      <SafeAreaView style={styles.flex}>
+        <View style={styles.loaderOverlay}>
+          <ActivityIndicator size="large" />
+        </View>
+      </SafeAreaView>
+    );
   }
 
   return (
@@ -180,6 +267,7 @@ export default function App() {
             ref={webRef}
             source={{uri: WEB_APP_URL}}
             injectedJavaScriptBeforeContentLoaded={beforeLoad}
+            injectedJavaScript={CAPTURE_HOOK}
             onMessage={onMessage}
             onNavigationStateChange={onNavStateChange}
             onLoadEnd={() => setLoading(false)}
