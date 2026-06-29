@@ -19,6 +19,7 @@ import messaging from '@react-native-firebase/messaging';
 import DeviceInfo from 'react-native-device-info';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import CookieManager from '@react-native-cookies/cookies';
+import {applyGeofenceConfig, parseGeofenceData} from './src/geofence';
 
 // react-native-webview@14 isn't yet typed for React 19's stricter JSX, which
 // collapses the class component's props to `never`. Alias it to a properly typed
@@ -195,6 +196,17 @@ export default function App() {
         // The WebView auto-grants getUserMedia/geolocation once the app holds
         // these OS permissions, so the web app's camera/location code just works.
         await PermissionsAndroid.requestMultiple(perms);
+        // Background location must be requested separately, AFTER fine location,
+        // and (Android 11+) only sends the user to settings for "Allow all the
+        // time" — required for geofence EXIT to fire when the app is killed.
+        const fine = await PermissionsAndroid.check(
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        );
+        const bgPerm = (PermissionsAndroid.PERMISSIONS as Record<string, string>)
+          .ACCESS_BACKGROUND_LOCATION;
+        if (fine && bgPerm) {
+          await PermissionsAndroid.request(bgPerm as never);
+        }
       }
     } catch {
       // Permission flow is best-effort; the web app still works without push.
@@ -236,6 +248,11 @@ export default function App() {
 
     // Foreground push -> let the web app show an in-app toast (optional).
     const unsubMsg = messaging().onMessage(async m => {
+      // A `geofence` data message (re)configures the native geofence.
+      if (m?.data?.type === 'geofence') {
+        applyGeofenceConfig(parseGeofenceData(m.data as Record<string, string>));
+        return;
+      }
       webRef.current?.injectJavaScript(
         `window.dispatchEvent(new CustomEvent('klocky:push', { detail: ${JSON.stringify(
           m.data ?? {},
@@ -378,13 +395,20 @@ export default function App() {
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
           }>
-          <Text style={styles.errTitle}>Can't reach Klocky</Text>
+          <View style={styles.errIcon}>
+            <Text style={styles.errIconText}>!</Text>
+          </View>
+          <Text style={styles.errTitle}>No internet connection</Text>
           <Text style={styles.errBody}>
-            Check your internet connection and try again.
+            Klock couldn't load. Check your Wi-Fi or mobile data and try again.
           </Text>
-          <TouchableOpacity style={styles.btn} onPress={reload}>
-            <Text style={styles.btnText}>Retry</Text>
+          <TouchableOpacity
+            style={styles.btn}
+            activeOpacity={0.85}
+            onPress={reload}>
+            <Text style={styles.btnText}>Try again</Text>
           </TouchableOpacity>
+          <Text style={styles.errHint}>Pull down to refresh</Text>
         </ScrollView>
       ) : (
         <>
@@ -444,13 +468,37 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
-  errTitle: {fontSize: 18, fontWeight: '600', marginBottom: 8, color: '#111'},
-  errBody: {fontSize: 14, color: '#555', textAlign: 'center', marginBottom: 20},
-  btn: {
-    backgroundColor: '#2563eb',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 8,
+  errIcon: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: '#e8f5ec',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 20,
   },
-  btnText: {color: '#fff', fontWeight: '600'},
+  errIconText: {fontSize: 40, fontWeight: '800', color: '#1f8a4c'},
+  errTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    marginBottom: 8,
+    color: '#111',
+    textAlign: 'center',
+  },
+  errBody: {
+    fontSize: 15,
+    lineHeight: 21,
+    color: '#555',
+    textAlign: 'center',
+    marginBottom: 24,
+    maxWidth: 300,
+  },
+  btn: {
+    backgroundColor: '#1f8a4c',
+    paddingHorizontal: 32,
+    paddingVertical: 13,
+    borderRadius: 10,
+  },
+  btnText: {color: '#fff', fontWeight: '700', fontSize: 15},
+  errHint: {fontSize: 12, color: '#9aa0a6', marginTop: 16},
 });
