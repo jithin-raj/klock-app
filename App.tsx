@@ -1,4 +1,4 @@
-import React, {useEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -18,6 +18,7 @@ import type {WebViewNavigation} from 'react-native-webview';
 import messaging from '@react-native-firebase/messaging';
 import DeviceInfo from 'react-native-device-info';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import CookieManager from '@react-native-cookies/cookies';
 
 // react-native-webview@14 isn't yet typed for React 19's stricter JSX, which
 // collapses the class component's props to `never`. Alias it to a properly typed
@@ -28,34 +29,62 @@ const WebView = WebViewBase as unknown as React.ComponentType<
 
 const WEB_APP_URL = 'https://klock.vercel.app'; // <-- the Angular app URL
 
-// Where we persist the WebView's localStorage so the session survives the app
-// being swiped from recents / killed by the OS. (Android WebView batches its own
-// localStorage writes to disk and can drop the most recent ones on an abrupt kill,
-// which logs the user out — we mirror it here and restore it before Angular boots.)
-const LS_SNAPSHOT_KEY = 'klocky.localStorage.snapshot';
+// Where we persist the WebView's web storage so the session survives the app being
+// swiped from recents / killed by the OS. We mirror localStorage AND sessionStorage
+// (plus non-HttpOnly cookies) and restore them before Angular boots — Angular gates
+// "logged in" on sessionStorage/cookie state that a fresh app launch would otherwise
+// wipe (it survives an F5 but not an app kill), which is what logs the user out.
+const STATE_SNAPSHOT_KEY = 'klocky.webState.snapshot';
 
-// Runs in the page after each load: mirror localStorage back to native on every
+// Explicit auth handoff: Angular posts {type:'saveAuth', payload} on login, we
+// persist it natively, and re-expose it as `window.__KLOCKY_AUTH__` before every
+// page load so Angular can restore the session on startup (the app's token lives
+// only in localStorage, on a different API domain than the cookie/session checks).
+const AUTH_KEY = 'klocky.auth.payload';
+
+// The login session is gated by a cookie (likely HttpOnly, so JS can't read it).
+// We persist the WebView's cookies natively and re-set them with a long expiry
+// before the page loads, so the session survives the app being killed. This is
+// what actually keeps the user signed in across a swipe-from-recents.
+const COOKIE_SNAPSHOT_KEY = 'klocky.cookies.snapshot';
+const COOKIE_DOMAIN = WEB_APP_URL.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+const USE_WEBKIT = Platform.OS === 'ios';
+const COOKIE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// Runs in the page after each load: mirror web storage back to native on every
 // write (so the saved copy is always current, even right before an abrupt kill).
 const CAPTURE_HOOK = `
 (function () {
-  if (window.__klockyLSHook) { return; }
-  window.__klockyLSHook = true;
+  if (window.__klockyHook) { return; }
+  window.__klockyHook = true;
+  function dump(storage) {
+    var o = {};
+    for (var i = 0; i < storage.length; i++) {
+      var k = storage.key(i);
+      o[k] = storage.getItem(k);
+    }
+    return o;
+  }
   function snap() {
     try {
-      var o = {};
-      for (var i = 0; i < localStorage.length; i++) {
-        var k = localStorage.key(i);
-        o[k] = localStorage.getItem(k);
-      }
-      window.ReactNativeWebView.postMessage(JSON.stringify({type: 'ls', data: o}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'state',
+        local: dump(localStorage),
+        session: dump(sessionStorage),
+        cookie: document.cookie,
+      }));
     } catch (e) {}
   }
-  var _set = localStorage.setItem.bind(localStorage);
-  var _rem = localStorage.removeItem.bind(localStorage);
-  var _clr = localStorage.clear.bind(localStorage);
-  localStorage.setItem = function (k, v) { _set(k, v); snap(); };
-  localStorage.removeItem = function (k) { _rem(k); snap(); };
-  localStorage.clear = function () { _clr(); snap(); };
+  function wrap(storage) {
+    var s = storage.setItem.bind(storage);
+    var r = storage.removeItem.bind(storage);
+    var c = storage.clear.bind(storage);
+    storage.setItem = function (k, v) { s(k, v); snap(); };
+    storage.removeItem = function (k) { r(k); snap(); };
+    storage.clear = function () { c(); snap(); };
+  }
+  wrap(localStorage);
+  wrap(sessionStorage);
   snap();
 })();
 true;`;
@@ -70,19 +99,85 @@ export default function App() {
   // undefined = still reading the saved snapshot; string = the JSON to restore
   // (or null if there's nothing saved yet). We hold the WebView until it's known.
   const [snapshot, setSnapshot] = useState<string | null | undefined>(undefined);
+  // Becomes true once saved cookies have been re-applied to the WebView's cookie
+  // store. We must hold the WebView until then, so the first request carries them.
+  const [cookiesReady, setCookiesReady] = useState(false);
+  // The saved auth payload (JSON string) handed over by Angular on login.
+  // undefined = still loading; null = none saved. Held until known.
+  const [auth, setAuth] = useState<string | null | undefined>(undefined);
 
   useEffect(() => {
-    AsyncStorage.getItem(LS_SNAPSHOT_KEY)
+    AsyncStorage.getItem(STATE_SNAPSHOT_KEY)
       .then(v => setSnapshot(v))
       .catch(() => setSnapshot(null));
+    AsyncStorage.getItem(AUTH_KEY)
+      .then(v => setAuth(v))
+      .catch(() => setAuth(null));
   }, []);
 
-  // Inject the mobile flag + restore the saved localStorage as early as possible,
-  // before Angular bootstraps, so its auth guard sees the token and stays signed in.
+  // Restore saved cookies into the WebView before it loads, re-stamping each with
+  // a fresh expiry so a former session cookie now persists across app restarts.
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(COOKIE_SNAPSHOT_KEY);
+        if (raw) {
+          const cookies = JSON.parse(raw) as {name: string; value: string}[];
+          const expires = new Date(Date.now() + COOKIE_TTL_MS).toISOString();
+          for (const c of cookies) {
+            await CookieManager.set(
+              WEB_APP_URL,
+              {
+                name: c.name,
+                value: c.value,
+                domain: COOKIE_DOMAIN,
+                path: '/',
+                version: '1',
+                expires,
+                secure: true,
+              },
+              USE_WEBKIT,
+            );
+          }
+        }
+      } catch {
+        // Best-effort; if restore fails the user just logs in again.
+      } finally {
+        setCookiesReady(true);
+      }
+    })();
+  }, []);
+
+  // Read the WebView's current cookies and persist them, so the latest session
+  // (set by the server after login) is saved before the app can be killed.
+  const captureCookies = useCallback(async () => {
+    try {
+      const all = await CookieManager.get(WEB_APP_URL, USE_WEBKIT);
+      const list = Object.keys(all).map(name => ({
+        name,
+        value: all[name].value,
+      }));
+      if (list.length) {
+        await AsyncStorage.setItem(COOKIE_SNAPSHOT_KEY, JSON.stringify(list));
+      }
+    } catch {
+      // Ignore; we'll try again on the next capture trigger.
+    }
+  }, []);
+
+  // Inject the mobile flag + the saved auth payload + restore web storage as early
+  // as possible, before Angular bootstraps, so it can restore the session on startup
+  // and stay signed in. `window.__KLOCKY_AUTH__` is the explicit handoff; the storage
+  // restore (localStorage/sessionStorage/non-HttpOnly cookies) is a belt-and-suspenders.
   const beforeLoad =
     'window.__IS_MOBILE__ = true;' +
+    `window.__KLOCKY_AUTH__ = ${auth ? auth : 'null'};` +
     (snapshot
-      ? `try{var d=${snapshot};for(var k in d){if(Object.prototype.hasOwnProperty.call(d,k)){localStorage.setItem(k,d[k]);}}}catch(e){}`
+      ? `try{var d=${snapshot};` +
+        'if(d.local){for(var k in d.local){if(Object.prototype.hasOwnProperty.call(d.local,k)){localStorage.setItem(k,d.local[k]);}}}' +
+        'if(d.session){for(var k in d.session){if(Object.prototype.hasOwnProperty.call(d.session,k)){sessionStorage.setItem(k,d.session[k]);}}}' +
+        "if(d.cookie){d.cookie.split('; ').forEach(function(c){if(c){document.cookie=c;}});}" +
+        '}catch(e){}'
       : '') +
     ' true;';
 
@@ -179,46 +274,75 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
-  // Persist the latest localStorage so it survives the app being killed. Keep the
+  // Persist the latest web storage so it survives the app being killed. Keep the
   // in-memory `snapshot` in sync too, so a same-session WebView reload restores it.
   function saveSnapshot(json: string) {
     setSnapshot(json);
-    AsyncStorage.setItem(LS_SNAPSHOT_KEY, json).catch(() => {});
+    AsyncStorage.setItem(STATE_SNAPSHOT_KEY, json).catch(() => {});
+  }
+
+  // Persist / clear the explicit auth payload handed over by Angular.
+  function saveAuth(payload: unknown) {
+    const json = JSON.stringify(payload ?? {});
+    setAuth(json);
+    AsyncStorage.setItem(AUTH_KEY, json).catch(() => {});
+  }
+  function clearAuth() {
+    setAuth(null);
+    AsyncStorage.removeItem(AUTH_KEY).catch(() => {});
   }
 
   // Messages from the Angular app.
   function onMessage(e: WebViewMessageEvent) {
     try {
       const msg = JSON.parse(e.nativeEvent.data);
-      if (msg.type === 'ls') {
-        saveSnapshot(JSON.stringify(msg.data ?? {}));
+      if (msg.type === 'saveAuth') {
+        saveAuth(msg.payload);
+        return;
+      }
+      if (msg.type === 'clearAuth') {
+        clearAuth();
+        return;
+      }
+      if (msg.type === 'state') {
+        saveSnapshot(
+          JSON.stringify({
+            local: msg.local ?? {},
+            session: msg.session ?? {},
+            cookie: msg.cookie ?? '',
+          }),
+        );
         return;
       }
       if (msg.type === 'requestDevice' || msg.type === 'loggedIn') {
         pushDeviceInfo();
       }
-      // 'loggedOut' handling (clear token) is done by the web app calling
-      // /logout with deviceId.
+      // On logout Angular should also post {type:'clearAuth'} so the saved token
+      // is removed and the user isn't auto-restored on next launch.
     } catch {}
   }
 
   // Final flush when the app is backgrounded (often the last event before a
-  // swipe-from-recents kill): ask the page to push its current localStorage.
+  // swipe-from-recents kill): ask the page to push its current web storage.
   useEffect(() => {
     const flush =
-      'try{var o={};for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);' +
-      'o[k]=localStorage.getItem(k);}' +
-      "window.ReactNativeWebView.postMessage(JSON.stringify({type:'ls',data:o}));}catch(e){} true;";
+      'try{function dump(s){var o={};for(var i=0;i<s.length;i++){var k=s.key(i);o[k]=s.getItem(k);}return o;}' +
+      "window.ReactNativeWebView.postMessage(JSON.stringify({type:'state'," +
+      'local:dump(localStorage),session:dump(sessionStorage),cookie:document.cookie}));}catch(e){} true;';
     const sub = AppState.addEventListener('change', state => {
       if (state !== 'active') {
         webRef.current?.injectJavaScript(flush);
+        captureCookies();
       }
     });
     return () => sub.remove();
-  }, []);
+  }, [captureCookies]);
 
   function onNavStateChange(nav: WebViewNavigation) {
     canGoBack.current = nav.canGoBack;
+    // Capture cookies after navigations (e.g. the post-login redirect that sets
+    // the session cookie) so the saved copy reflects the latest session.
+    captureCookies();
   }
 
   function reload() {
@@ -233,9 +357,10 @@ export default function App() {
     setRefreshing(false);
   }
 
-  // Wait until the saved localStorage has been read, so it can be restored into
-  // the WebView before Angular bootstraps (avoids a flash of the login screen).
-  if (snapshot === undefined) {
+  // Wait until the saved storage + auth payload have been read and cookies have
+  // been re-applied, so everything is in place before Angular bootstraps (avoids a
+  // flash of the login screen and ensures the first request carries the session).
+  if (snapshot === undefined || auth === undefined || !cookiesReady) {
     return (
       <SafeAreaView style={styles.flex}>
         <View style={styles.loaderOverlay}>
@@ -270,7 +395,10 @@ export default function App() {
             injectedJavaScript={CAPTURE_HOOK}
             onMessage={onMessage}
             onNavigationStateChange={onNavStateChange}
-            onLoadEnd={() => setLoading(false)}
+            onLoadEnd={() => {
+              setLoading(false);
+              captureCookies();
+            }}
             onError={() => {
               setError(true);
               setLoading(false);
@@ -282,6 +410,8 @@ export default function App() {
             originWhitelist={['*']}
             javaScriptEnabled
             domStorageEnabled
+            sharedCookiesEnabled
+            thirdPartyCookiesEnabled
             pullToRefreshEnabled
             startInLoadingState
           />

@@ -27,6 +27,15 @@ jest.mock('@react-native-async-storage/async-storage', () => ({
   },
 }));
 
+jest.mock('@react-native-cookies/cookies', () => ({
+  __esModule: true,
+  default: {
+    get: jest.fn().mockResolvedValue({}),
+    set: jest.fn().mockResolvedValue(undefined),
+    clearAll: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 jest.mock('react-native-webview', () => {
   const React = require('react');
   return {WebView: () => React.createElement('WebView')};
