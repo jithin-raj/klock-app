@@ -1,5 +1,6 @@
 import {NativeModules, Platform} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import DeviceInfo from 'react-native-device-info';
 
 const {GeofenceModule} = NativeModules as {
   GeofenceModule?: {
@@ -59,11 +60,11 @@ export async function applyGeofenceConfig(cfg: GeofenceConfig): Promise<void> {
 
 /**
  * Headless task body: runs when the user leaves the geofence, even if the app
- * has been killed. Calls the clock-out API with the still-valid token (the user
- * is identified server-side from the token, so no body is sent). The server then
- * pushes the clock-out status back via FCM, which displays to the user (system
- * tray when backgrounded/killed). The session is left untouched — the user stays
- * signed in until their token expires.
+ * has been killed. Calls the clock-out API with the still-valid token. The
+ * server identifies the user from the token and de-dupes (the call is safe to
+ * fire multiple times). It then pushes the clock-out status back via FCM, which
+ * displays to the user (system tray when backgrounded/killed). The session is
+ * left untouched — the user stays signed in until their token expires.
  */
 export async function onGeofenceExit(): Promise<void> {
   let token: string | undefined;
@@ -76,10 +77,23 @@ export async function onGeofenceExit(): Promise<void> {
     return; // No token handed over by Angular yet — nothing we can authenticate.
   }
 
+  let deviceId = '';
+  try {
+    deviceId = await DeviceInfo.getUniqueId();
+  } catch {}
+
   try {
     await fetch(CLOCKOUT_URL, {
       method: 'POST',
-      headers: {Authorization: `Bearer ${token}`},
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        source: 'geofence',
+        deviceId,
+        at: new Date().toISOString(),
+      }),
     });
   } catch {
     // Best-effort; if offline the clock-out simply doesn't fire this time.
