@@ -1,8 +1,8 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {
-  ActivityIndicator,
   AppState,
   BackHandler,
+  Image,
   Platform,
   PermissionsAndroid,
   RefreshControl,
@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import {WebView as WebViewBase, WebViewMessageEvent} from 'react-native-webview';
@@ -50,6 +51,7 @@ const AUTH_KEY = 'klocky.auth.payload';
 const COOKIE_SNAPSHOT_KEY = 'klocky.cookies.snapshot';
 const COOKIE_DOMAIN = WEB_APP_URL.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 const USE_WEBKIT = Platform.OS === 'ios';
+const LOADER_GIF = require('./assets/loader.gif');
 const COOKIE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // Runs in the page after each load: mirror web storage back to native on every
@@ -91,6 +93,11 @@ const CAPTURE_HOOK = `
 true;`;
 
 export default function App() {
+  // Scale the loader relative to the shorter screen dimension so it looks
+  // consistent across phones and tablets, and re-adapts on rotation.
+  const {width: winW, height: winH} = useWindowDimensions();
+  const loaderSize = Math.min(140, Math.max(80, Math.min(winW, winH) * 0.22));
+
   const webRef = useRef<WebViewBase>(null);
   const [, setDeviceId] = useState<string>('');
   const [loading, setLoading] = useState(true);
@@ -381,7 +388,11 @@ export default function App() {
     return (
       <SafeAreaView style={styles.flex}>
         <View style={styles.loaderOverlay}>
-          <ActivityIndicator size="large" />
+          <Image
+            source={LOADER_GIF}
+            style={{width: loaderSize, height: loaderSize}}
+            resizeMode="contain"
+          />
         </View>
       </SafeAreaView>
     );
@@ -441,7 +452,11 @@ export default function App() {
           />
           {loading && (
             <View style={styles.loaderOverlay} pointerEvents="none">
-              <ActivityIndicator size="large" />
+              <Image
+            source={LOADER_GIF}
+            style={{width: loaderSize, height: loaderSize}}
+            resizeMode="contain"
+          />
             </View>
           )}
         </>

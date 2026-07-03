@@ -128,6 +128,10 @@ dependencies {
     // Native geofencing (GeofencingClient) for background work-area detection.
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
+    // Fresco (RN's Android image loader) needs this to decode/animate GIFs;
+    // without it, <Image> only renders the static first frame.
+    implementation("com.facebook.fresco:animated-gif:3.6.0")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {
