@@ -30,6 +30,7 @@ const WebView = WebViewBase as unknown as React.ComponentType<
 >;
 
 const WEB_APP_URL = 'https://klock.vercel.app'; // <-- the Angular app URL
+const API_BASE = 'https://klock-api.onrender.com';
 
 // Where we persist the WebView's web storage so the session survives the app being
 // swiped from recents / killed by the OS. We mirror localStorage AND sessionStorage
@@ -53,6 +54,13 @@ const COOKIE_DOMAIN = WEB_APP_URL.replace(/^https?:\/\//, '').replace(/\/.*$/, '
 const USE_WEBKIT = Platform.OS === 'ios';
 const LOADER_GIF = require('./assets/loader.gif');
 const COOKIE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// After this long backgrounded, the OS may have killed the WebView's renderer
+// to reclaim memory (e.g. left overnight) — the WebView then just sits blank
+// with no error event, since that isn't a network failure. Force a reload on
+// resume once we've been away this long, rather than waiting for the user to
+// notice a stuck white screen and force-quit the app.
+const STALE_BACKGROUND_MS = 15 * 60 * 1000; // 15 minutes
 
 // Runs in the page after each load: mirror web storage back to native on every
 // write (so the saved copy is always current, even right before an abrupt kill).
@@ -104,6 +112,18 @@ export default function App() {
   const [error, setError] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const canGoBack = useRef(false);
+  // Timestamp of the last time the app left 'active'; used to detect a long
+  // background stint on resume (see STALE_BACKGROUND_MS).
+  const backgroundedAt = useRef<number | null>(null);
+  // Grace-period timer between the WebView finishing its document load and
+  // Angular actually painting — see onLoadEnd / the 'ready' message below.
+  const loaderFallback = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function clearLoaderFallback() {
+    if (loaderFallback.current) {
+      clearTimeout(loaderFallback.current);
+      loaderFallback.current = null;
+    }
+  }
   // undefined = still reading the saved snapshot; string = the JSON to restore
   // (or null if there's nothing saved yet). We hold the WebView until it's known.
   const [snapshot, setSnapshot] = useState<string | null | undefined>(undefined);
@@ -231,8 +251,26 @@ export default function App() {
           {deviceId: id, platform, fcmToken},
         )} })); true;`,
       );
+      // Register directly with the backend too — don't rely solely on the web
+      // app's bridge (docs/angular-bridge.md) picking up the `klocky:device`
+      // event and posting it, since that requires an Angular-side change we
+      // don't control from this repo.
+      const raw = await AsyncStorage.getItem(AUTH_KEY);
+      const token = raw ? JSON.parse(raw)?.token : undefined;
+      if (token) {
+        await fetch(`${API_BASE}/api/mobile/register-device`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({platform, deviceId: id, fcmToken}),
+        });
+      }
     } catch {
-      // FCM may be unavailable (e.g. no Google Play services); fail silently.
+      // FCM may be unavailable (e.g. no Google Play services), or the register
+      // call may fail while offline; either way, fail silently and rely on the
+      // next token refresh / login to retry.
     }
   }
 
@@ -246,6 +284,15 @@ export default function App() {
       )} })); true;`,
     );
   }
+
+  // Register the device whenever we have a valid auth token — covers login
+  // (saveAuth) and a cold app restart while already logged in, without
+  // depending on the web app explicitly asking for it.
+  useEffect(() => {
+    if (auth) {
+      pushDeviceInfo();
+    }
+  }, [auth]);
 
   useEffect(() => {
     requestPermissions();
@@ -312,6 +359,26 @@ export default function App() {
     AsyncStorage.setItem(AUTH_KEY, json).catch(() => {});
   }
   function clearAuth() {
+    // Deregister this device before dropping the token, so the server stops
+    // pushing to it (best-effort — uses the token that's about to be cleared).
+    (async () => {
+      try {
+        const token = auth ? JSON.parse(auth)?.token : undefined;
+        if (token) {
+          const id = await DeviceInfo.getUniqueId();
+          await fetch(`${API_BASE}/api/mobile/logout`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({deviceId: id}),
+          });
+        }
+      } catch {
+        // Best-effort; the token will just sit unused until it expires.
+      }
+    })();
     setAuth(null);
     AsyncStorage.removeItem(AUTH_KEY).catch(() => {});
   }
@@ -338,6 +405,13 @@ export default function App() {
         );
         return;
       }
+      if (msg.type === 'ready') {
+        // Angular has actually bootstrapped and painted — hide the loader now
+        // instead of waiting on the fallback timer.
+        clearLoaderFallback();
+        setLoading(false);
+        return;
+      }
       if (msg.type === 'requestDevice' || msg.type === 'loggedIn') {
         pushDeviceInfo();
       }
@@ -357,6 +431,15 @@ export default function App() {
       if (state !== 'active') {
         webRef.current?.injectJavaScript(flush);
         captureCookies();
+        backgroundedAt.current = Date.now();
+        return;
+      }
+      // Resumed. If we were away long enough that the OS likely killed the
+      // WebView's renderer, force a reload rather than risk a stuck blank page.
+      const since = backgroundedAt.current;
+      backgroundedAt.current = null;
+      if (since !== null && Date.now() - since > STALE_BACKGROUND_MS) {
+        reload();
       }
     });
     return () => sub.remove();
@@ -370,6 +453,7 @@ export default function App() {
   }
 
   function reload() {
+    clearLoaderFallback();
     setError(false);
     setLoading(true);
     webRef.current?.reload();
@@ -431,13 +515,27 @@ export default function App() {
             onMessage={onMessage}
             onNavigationStateChange={onNavStateChange}
             onLoadEnd={() => {
-              setLoading(false);
+              // The WebView finishing its document load isn't the same as
+              // Angular having actually painted a screen — keep the loader
+              // up until either the 'ready' message arrives (fast path) or
+              // this grace period elapses (fallback, in case the web app
+              // never sends it).
               captureCookies();
+              clearLoaderFallback();
+              loaderFallback.current = setTimeout(() => setLoading(false), 1200);
             }}
             onError={() => {
+              clearLoaderFallback();
               setError(true);
               setLoading(false);
             }}
+            // The WebView's renderer can be killed by the OS to reclaim memory
+            // (typically after a long background stint) without firing
+            // onError, since it isn't a network failure — it just leaves a
+            // blank/frozen page. Reload to recover instead of leaving the
+            // user stuck on a white screen.
+            onRenderProcessGone={reload} // Android
+            onContentProcessDidTerminate={reload} // iOS
             // Let the web app use camera + geolocation:
             geolocationEnabled
             mediaCapturePermissionGrantType="grant" // iOS

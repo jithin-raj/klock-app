@@ -4,6 +4,13 @@
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <!-- A plain, deliberate white background during the native
+             cold-start, before the JS bundle mounts and paints the loader.
+             (A layer-list/bitmap combo referencing the launcher icon was
+             tried here, but a release-build resource optimizer stripped
+             the <bitmap> src attribute and crashed the app on launch —
+             see git history. A direct color reference is immune to that.) -->
+        <item name="android:windowBackground">@android:color/white</item>
     </style>
 
 </resources>
